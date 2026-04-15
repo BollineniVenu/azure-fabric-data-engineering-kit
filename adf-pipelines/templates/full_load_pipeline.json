@@ -1,0 +1,230 @@
+{
+  "name": "FullLoadPipeline",
+  "properties": {
+    "description": "Full truncate-reload pipeline for dimension tables using ForEach iterator",
+    "parameters": {
+      "tableList": {
+        "type": "array",
+        "defaultValue": [
+          {
+            "source": "dbo.dim_customer",
+            "sink": "bronze/dim_customer"
+          },
+          {
+            "source": "dbo.dim_product",
+            "sink": "bronze/dim_product"
+          },
+          {
+            "source": "dbo.dim_region",
+            "sink": "bronze/dim_region"
+          },
+          {
+            "source": "dbo.dim_date",
+            "sink": "bronze/dim_date"
+          }
+        ]
+      },
+      "loadBatchId": {
+        "type": "string",
+        "defaultValue": "@utcNow()"
+      }
+    },
+    "activities": [
+      {
+        "name": "ForEachTable",
+        "type": "ForEach",
+        "description": "Iterate over each dimension table and perform full reload",
+        "typeProperties": {
+          "items": {
+            "value": "@pipeline().parameters.tableList",
+            "type": "Expression"
+          },
+          "isSequential": false,
+          "batchCount": 4,
+          "activities": [
+            {
+              "name": "LogStartLoad",
+              "type": "SqlServerStoredProcedure",
+              "description": "Log pipeline run start in control table",
+              "typeProperties": {
+                "storedProcedureName": "dbo.usp_LogPipelineRun",
+                "storedProcedureParameters": {
+                  "PipelineName": {
+                    "value": "FullLoadPipeline",
+                    "type": "String"
+                  },
+                  "TableName": {
+                    "value": "@item().source",
+                    "type": "String"
+                  },
+                  "Status": {
+                    "value": "RUNNING",
+                    "type": "String"
+                  },
+                  "BatchId": {
+                    "value": "@pipeline().parameters.loadBatchId",
+                    "type": "String"
+                  },
+                  "RowsProcessed": {
+                    "value": 0,
+                    "type": "Int32"
+                  }
+                }
+              },
+              "linkedServiceName": {
+                "referenceName": "AzureSqlLinkedService",
+                "type": "LinkedServiceReference"
+              }
+            },
+            {
+              "name": "FullCopyTable",
+              "type": "Copy",
+              "description": "Full copy of source table to Fabric Lakehouse Bronze",
+              "dependsOn": [
+                {
+                  "activity": "LogStartLoad",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "policy": {
+                "timeout": "0.12:00:00",
+                "retry": 1,
+                "retryIntervalInSeconds": 60
+              },
+              "typeProperties": {
+                "source": {
+                  "type": "AzureSqlSource",
+                  "sqlReaderQuery": {
+                    "value": "SELECT *, GETUTCDATE() AS _ingested_at, '@{pipeline().parameters.loadBatchId}' AS _batch_id, 'full_load' AS _load_type FROM @{item().source}",
+                    "type": "Expression"
+                  },
+                  "queryTimeout": "02:00:00",
+                  "partitionOption": "None"
+                },
+                "sink": {
+                  "type": "ParquetSink",
+                  "storeSettings": {
+                    "type": "AzureBlobFSWriteSettings"
+                  },
+                  "formatSettings": {
+                    "type": "ParquetWriteSettings"
+                  }
+                },
+                "enableStaging": false,
+                "translator": {
+                  "type": "TabularTranslator",
+                  "typeConversion": true,
+                  "typeConversionSettings": {
+                    "allowDataTruncation": true,
+                    "treatBooleanAsNumber": false
+                  }
+                }
+              },
+              "inputs": [
+                {
+                  "referenceName": "AzureSqlSource",
+                  "type": "DatasetReference"
+                }
+              ],
+              "outputs": [
+                {
+                  "referenceName": "FabricLakehouseBronze",
+                  "type": "DatasetReference",
+                  "parameters": {
+                    "folderPath": "@item().sink"
+                  }
+                }
+              ]
+            },
+            {
+              "name": "LogSuccess",
+              "type": "SqlServerStoredProcedure",
+              "description": "Update control table with success status",
+              "dependsOn": [
+                {
+                  "activity": "FullCopyTable",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "storedProcedureName": "dbo.usp_LogPipelineRun",
+                "storedProcedureParameters": {
+                  "PipelineName": {
+                    "value": "FullLoadPipeline",
+                    "type": "String"
+                  },
+                  "TableName": {
+                    "value": "@item().source",
+                    "type": "String"
+                  },
+                  "Status": {
+                    "value": "SUCCEEDED",
+                    "type": "String"
+                  },
+                  "BatchId": {
+                    "value": "@pipeline().parameters.loadBatchId",
+                    "type": "String"
+                  },
+                  "RowsProcessed": {
+                    "value": "@activity('FullCopyTable').output.rowsCopied",
+                    "type": "Int32"
+                  }
+                }
+              },
+              "linkedServiceName": {
+                "referenceName": "AzureSqlLinkedService",
+                "type": "LinkedServiceReference"
+              }
+            },
+            {
+              "name": "LogFailure",
+              "type": "SqlServerStoredProcedure",
+              "description": "Update control table with failure status",
+              "dependsOn": [
+                {
+                  "activity": "FullCopyTable",
+                  "dependencyConditions": [
+                    "Failed"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "storedProcedureName": "dbo.usp_LogPipelineRun",
+                "storedProcedureParameters": {
+                  "PipelineName": {
+                    "value": "FullLoadPipeline",
+                    "type": "String"
+                  },
+                  "TableName": {
+                    "value": "@item().source",
+                    "type": "String"
+                  },
+                  "Status": {
+                    "value": "FAILED",
+                    "type": "String"
+                  },
+                  "BatchId": {
+                    "value": "@pipeline().parameters.loadBatchId",
+                    "type": "String"
+                  },
+                  "RowsProcessed": {
+                    "value": 0,
+                    "type": "Int32"
+                  }
+                }
+              },
+              "linkedServiceName": {
+                "referenceName": "AzureSqlLinkedService",
+                "type": "LinkedServiceReference"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
