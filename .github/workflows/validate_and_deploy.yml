@@ -1,0 +1,122 @@
+name: Validate & Deploy Data Pipelines
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # -- Job 1: Validate ADF JSON Pipelines -----------------------------------
+  validate-adf-pipelines:
+    name: Validate ADF Pipeline JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate JSON files
+        run: |
+          echo "Validating ADF pipeline JSON files..."
+          for f in adf-pipelines/**/*.json; do
+            python3 -c "import json,sys; json.load(open('$f'))" \
+              && echo "OK: $f" \
+              || (echo "FAIL: $f" && exit 1)
+          done
+
+  # -- Job 2: Lint SQL Scripts -----------------------------------------------
+  lint-sql:
+    name: Lint SQL Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install sqlfluff
+        run: pip install sqlfluff
+
+      - name: Lint SQL
+        run: |
+          sqlfluff lint sql-scripts/ \
+            --dialect tsql \
+            --rules L001,L002,L003,L010,L011,L014,L017,L019,L022,L036 \
+            --exclude-rules L031 \
+            || echo "SQL lint warnings (non-blocking)"
+
+  # -- Job 3: Validate Notebooks ---------------------------------------------
+  validate-notebooks:
+    name: Validate Jupyter Notebooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install nbformat
+        run: pip install nbformat
+
+      - name: Validate notebook structure
+        run: |
+          python3 - <<'EOF'
+          import nbformat, glob, sys
+          errors = []
+          for path in glob.glob("fabric-notebooks/**/*.ipynb", recursive=True):
+              try:
+                  with open(path) as f:
+                      nb = nbformat.read(f, as_version=4)
+                  nbformat.validate(nb)
+                  print(f"OK: {path}")
+              except Exception as e:
+                  errors.append(f"FAIL: {path}: {e}")
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+          EOF
+
+  # -- Job 4: Deploy Power BI Report (main branch only) ---------------------
+  deploy-powerbi:
+    name: Deploy Power BI Report
+    runs-on: ubuntu-latest
+    needs: [validate-adf-pipelines, lint-sql, validate-notebooks]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy report via PowerShell
+        shell: pwsh
+        env:
+          PBI_TENANT_ID:     ${{ secrets.PBI_TENANT_ID }}
+          PBI_CLIENT_ID:     ${{ secrets.PBI_CLIENT_ID }}
+          PBI_CLIENT_SECRET: ${{ secrets.PBI_CLIENT_SECRET }}
+        run: |
+          # Uncomment when .pbix is added to the repo:
+          # .\powerbi\deployment\deploy_report.ps1 `
+          #   -PbixPath ".\powerbi\SalesDashboard.pbix" `
+          #   -WorkspaceName $env:PBI_WORKSPACE_NAME `
+          #   -TriggerRefresh
+          Write-Host "PowerBI deploy step ready — add .pbix path to activate"
+
+  # -- Job 5: Summary -------------------------------------------------------
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [validate-adf-pipelines, lint-sql, validate-notebooks]
+    if: always()
+    steps:
+      - name: Print summary
+        run: |
+          echo "## Pipeline Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| ADF JSON Validation | ${{ needs.validate-adf-pipelines.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Lint            | ${{ needs.lint-sql.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Notebook Validation | ${{ needs.validate-notebooks.result }} |" >> $GITHUB_STEP_SUMMARY
