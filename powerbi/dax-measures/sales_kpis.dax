@@ -1,0 +1,34 @@
+// POWER BI DAX MEASURES - Sales KPI Library
+// Compatible with DirectLake (Fabric) and Import/DirectQuery modes
+
+// BASE MEASURES
+[Total Revenue] = SUMX(fact_sales, fact_sales[quantity] * fact_sales[unit_price])
+[Total Orders] = DISTINCTCOUNT(fact_sales[sale_id])
+[Total Units Sold] = SUM(fact_sales[quantity])
+[Unique Customers] = DISTINCTCOUNT(fact_sales[customer_id])
+[Average Order Value] = DIVIDE([Total Revenue], [Total Orders], 0)
+
+// TIME INTELLIGENCE
+[Revenue MTD] = CALCULATE([Total Revenue], DATESMTD(dim_date[date]))
+[Revenue QTD] = CALCULATE([Total Revenue], DATESQTD(dim_date[date]))
+[Revenue YTD] = CALCULATE([Total Revenue], DATESYTD(dim_date[date]))
+[Revenue PY]  = CALCULATE([Total Revenue], SAMEPERIODLASTYEAR(dim_date[date]))
+[Revenue YoY %] = VAR _c = [Total Revenue] VAR _p = [Revenue PY] RETURN DIVIDE(_c - _p, _p, BLANK())
+[Revenue MoM %] = VAR _c = [Total Revenue] VAR _p = CALCULATE([Total Revenue], DATEADD(dim_date[date], -1, MONTH)) RETURN DIVIDE(_c - _p, _p, BLANK())
+[Rolling 3M Revenue]  = CALCULATE([Total Revenue], DATESINPERIOD(dim_date[date], LASTDATE(dim_date[date]), -3,  MONTH))
+[Rolling 12M Revenue] = CALCULATE([Total Revenue], DATESINPERIOD(dim_date[date], LASTDATE(dim_date[date]), -12, MONTH))
+
+// RANKING
+[Customer Revenue Rank] = RANKX(ALLSELECTED(dim_customer[customer_name]), [Total Revenue],, DESC, DENSE)
+[Product Revenue Rank]  = RANKX(ALLSELECTED(dim_product[product_name]),   [Total Revenue],, DESC, DENSE)
+
+// PERCENT OF TOTAL
+[Revenue % of Total]  = DIVIDE([Total Revenue], CALCULATE([Total Revenue], ALL(fact_sales)))
+[Revenue % of Region] = DIVIDE([Total Revenue], CALCULATE([Total Revenue], ALLEXCEPT(fact_sales, fact_sales[region])))
+
+// TARGETS
+[Revenue vs Target] = VAR _r = [Total Revenue] VAR _t = SUM(targets[target_revenue]) RETURN DIVIDE(_r - _t, _t, BLANK())
+[Revenue RAG Status] = VAR _p = [Revenue vs Target] RETURN SWITCH(TRUE(), _p >= 0.05, "Green - On Track", _p >= -0.05, "Amber - At Risk", "Red - Behind")
+
+// DYNAMIC TITLE
+[Dynamic Title] = "Sales Dashboard - " & FORMAT(MAX(dim_date[date]), "MMMM YYYY") & "  |  Revenue: " & FORMAT([Total Revenue], "$#,0")
