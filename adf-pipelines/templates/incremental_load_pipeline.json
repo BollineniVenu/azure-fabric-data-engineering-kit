@@ -1,0 +1,206 @@
+{
+  "name": "IncrementalLoadPipeline",
+  "properties": {
+    "description": "Watermark-based incremental copy from Azure SQL to Fabric Lakehouse Bronze layer",
+    "parameters": {
+      "sourceTableName": {
+        "type": "string",
+        "defaultValue": "dbo.sales"
+      },
+      "watermarkColumn": {
+        "type": "string",
+        "defaultValue": "updated_at"
+      },
+      "sinkContainer": {
+        "type": "string",
+        "defaultValue": "bronze"
+      }
+    },
+    "activities": [
+      {
+        "name": "LookupWatermark",
+        "type": "Lookup",
+        "description": "Get current watermark from control table",
+        "policy": {
+          "timeout": "0.00:05:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "sqlReaderQuery": {
+              "value": "SELECT watermark_value FROM dbo.pipeline_control WHERE table_name = '@{pipeline().parameters.sourceTableName}'",
+              "type": "Expression"
+            }
+          },
+          "dataset": {
+            "referenceName": "AzureSqlControlTable",
+            "type": "DatasetReference"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "GetCurrentTime",
+        "type": "Lookup",
+        "description": "Get current max watermark from source",
+        "dependsOn": [
+          {
+            "activity": "LookupWatermark",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:05:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "sqlReaderQuery": {
+              "value": "SELECT MAX(@{pipeline().parameters.watermarkColumn}) AS NewWatermark FROM @{pipeline().parameters.sourceTableName}",
+              "type": "Expression"
+            }
+          },
+          "dataset": {
+            "referenceName": "AzureSqlSource",
+            "type": "DatasetReference"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "CopyIncrementalData",
+        "type": "Copy",
+        "description": "Copy rows newer than watermark to Fabric Lakehouse Delta Bronze",
+        "dependsOn": [
+          {
+            "activity": "GetCurrentTime",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60
+        },
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "sqlReaderQuery": {
+              "value": "SELECT *, GETUTCDATE() AS _ingested_at, '@{pipeline().RunId}' AS _batch_id FROM @{pipeline().parameters.sourceTableName} WHERE @{pipeline().parameters.watermarkColumn} > '@{activity('LookupWatermark').output.firstRow.watermark_value}' AND @{pipeline().parameters.watermarkColumn} <= '@{activity('GetCurrentTime').output.firstRow.NewWatermark}'",
+              "type": "Expression"
+            },
+            "queryTimeout": "02:00:00"
+          },
+          "sink": {
+            "type": "ParquetSink",
+            "storeSettings": {
+              "type": "AzureBlobFSWriteSettings",
+              "copyBehavior": "MergeFiles"
+            }
+          },
+          "enableStaging": false,
+          "dataIntegrationUnits": 4
+        },
+        "inputs": [
+          {
+            "referenceName": "AzureSqlSource",
+            "type": "DatasetReference"
+          }
+        ],
+        "outputs": [
+          {
+            "referenceName": "FabricLakehouseBronze",
+            "type": "DatasetReference",
+            "parameters": {
+              "container": "@pipeline().parameters.sinkContainer",
+              "folder": "@pipeline().parameters.sourceTableName"
+            }
+          }
+        ]
+      },
+      {
+        "name": "UpdateWatermark",
+        "type": "SqlServerStoredProcedure",
+        "description": "Advance watermark in control table after successful copy",
+        "dependsOn": [
+          {
+            "activity": "CopyIncrementalData",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:05:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "storedProcedureName": "dbo.usp_UpdateWatermark",
+          "storedProcedureParameters": {
+            "TableName": {
+              "value": "@pipeline().parameters.sourceTableName",
+              "type": "String"
+            },
+            "NewWatermark": {
+              "value": "@activity('GetCurrentTime').output.firstRow.NewWatermark",
+              "type": "DateTime"
+            },
+            "RowsCopied": {
+              "value": "@activity('CopyIncrementalData').output.rowsCopied",
+              "type": "Int32"
+            }
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "AzureSqlLinkedService",
+          "type": "LinkedServiceReference"
+        }
+      },
+      {
+        "name": "TriggerFabricNotebook",
+        "type": "WebActivity",
+        "description": "Trigger Fabric notebook to process Bronze to Silver",
+        "dependsOn": [
+          {
+            "activity": "UpdateWatermark",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "1.00:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60
+        },
+        "typeProperties": {
+          "method": "POST",
+          "url": {
+            "value": "@concat('https://api.fabric.microsoft.com/v1/workspaces/', pipeline().parameters.fabricWorkspaceId, '/items/', pipeline().parameters.notebookId, '/jobs/instances?jobType=RunNotebook')",
+            "type": "Expression"
+          },
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "{\"executionData\":{\"parameters\":{\"table_name\":\"@{pipeline().parameters.sourceTableName}\"}}}",
+            "type": "Expression"
+          },
+          "authentication": {
+            "type": "MSI",
+            "resource": "https://analysis.windows.net/powerbi/api"
+          }
+        }
+      }
+    ]
+  }
+}
